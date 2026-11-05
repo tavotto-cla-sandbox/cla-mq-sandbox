@@ -4,6 +4,7 @@ name: CLA (staging consumer)
 on:
   pull_request:
     branches: [main]
+  merge_group:
 permissions:
   contents: read
   pull-requests: read
@@ -16,8 +17,8 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           repository: Tavotto/Tavotto
-          # Tavotto main merge commit of PR #1689 (carries deployment/staging/ci.json).
-          ref: b32683a9359368d9d64fe1c0bbb993c003d20612
+          # Tavotto main merge commit of PR #1752 (ci.json points at this org sandbox).
+          ref: 3038ca84f89fb9c5a46d100f3624751a75f24ea0
           path: trusted
           persist-credentials: false
           sparse-checkout: services/cla-cloudflare
@@ -30,4 +31,4 @@ jobs:
         run: >
           node trusted/services/cla-cloudflare/scripts/ci-candidate.mjs
           --config trusted/services/cla-cloudflare/deployment/staging/ci.json
-          --event-file "$GITHUB_EVENT_PATH" --event pull_request
+          --event-file "$GITHUB_EVENT_PATH" --event "${{ github.event_name }}"
