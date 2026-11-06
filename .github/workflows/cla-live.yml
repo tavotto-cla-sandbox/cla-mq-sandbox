@@ -28,7 +28,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           REF: ${{ github.event.repository.default_branch }}
-          SCRIPT_REF: 0794db9c40e952ef4aa6a2dcb85bc191df4cb257
+          SCRIPT_REF: 71ba5a005c16169524f9426c8c13e855d0d05aa6
         run: |
           set -euo pipefail
           TRUSTED="$RUNNER_TEMP/trusted-cla"
@@ -287,6 +287,21 @@ jobs:
                  --eligibility-nonce="$nonce"
                  --eligibility-json "$answer")
           python3 -I "$TRUSTED/scripts/ci/cla_gate.py" "${ARGS[@]}"
+
+      - name: Diagnose target and member binding on failure
+        if: failure()
+        run: |
+          set -euo pipefail
+          if [ -s "$RUNNER_TEMP/cla-eligibility.json" ]; then
+            jq 'del(.contributors,.nonce)' "$RUNNER_TEMP/cla-eligibility.json"
+          fi
+          if [ -s "$RUNNER_TEMP/group-snapshot.json" ]; then
+            jq '{base_sha,head_sha,
+              queue:[.queue_before[].data.repository.mergeQueue.entries.nodes[] |
+                {position,pr:.pullRequest.number,head_sha:.pullRequest.headRefOid}],
+              prs:[.prs[] | {pr:.before.number,head_sha:.before.head.sha}]}' \
+              "$RUNNER_TEMP/group-snapshot.json"
+          fi
 
   # ────────────────────────────────────────────────────────────────
   # 发行说明闸：用户可见的 PR 必须新增 docs/release-notes/unreleased/<主题>.md 片段
