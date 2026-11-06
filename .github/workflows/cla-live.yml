@@ -1,0 +1,325 @@
+# STAGING ONLY: pinned trusted scripts; no PR code checkout or execution.
+name: CLA live eligibility acceptance
+on:
+  pull_request:
+    branches: [main]
+  merge_group:
+permissions:
+  contents: read
+  pull-requests: read
+env:
+  TAVOTTO_NO_TELEMETRY: "1"
+jobs:
+  cla-check:
+    name: CLA live eligibility (staging)
+    # 与其它快线一致；**merge_group 必须在内**（见上面第 1 条）。
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    runs-on: ubuntu-24.04
+    # 含服务取数约两分钟的重试预算；元数据读取、最后一次判定另留余量。
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      # 判定的全部输入取自默认分支——**不 checkout 本次 revision**。
+      # 与两个 Gate 取判定器同一个理由：被审的树不能参与判定自己。
+      - name: Fetch pinned trusted scripts and sandbox default-branch policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.event.repository.default_branch }}
+          SCRIPT_REF: 71ba5a005c16169524f9426c8c13e855d0d05aa6
+        run: |
+          set -euo pipefail
+          TRUSTED="$RUNNER_TEMP/trusted-cla"
+          mkdir -p "$TRUSTED/scripts/ci" "$TRUSTED/.github" "$TRUSTED/docs/legal"
+          REF=$(gh api "repos/$REPO/commits/$REF" --jq .sha)
+          [[ "$REF" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          for file in scripts/ci/cla_gate.py scripts/ci/cla_eligibility_fetch.py; do
+            gh api "repos/Tavotto/Tavotto/contents/$file?ref=$SCRIPT_REF" --jq .content               | base64 -d > "$TRUSTED/$file"
+            test -s "$TRUSTED/$file"
+          done
+          for file in .github/cla-policy.json docs/legal/CLA_INDIVIDUAL.md docs/legal/CLA_CORPORATE.md; do
+            gh api "repos/$REPO/contents/$file?ref=$REF" --jq .content               | base64 -d > "$TRUSTED/$file"
+            test -s "$TRUSTED/$file"
+          done
+          echo "TRUSTED=$TRUSTED" >> "$GITHUB_ENV"
+          echo "CLA_SERVICE_MODE=yes" >> "$GITHUB_ENV"
+
+      # PR 侧只读元数据：作者 + 每个 commit 的 author + Co-authored-by。
+      # 只看 PR 发起人是不够的——commit 作者和 co-author 同样在投稿。
+      #
+      # **数据源是 compare，不是 `pulls/{n}/commits`（#318）。** 后者的响应
+      # **封顶 250 条**（官方文档原话「Lists a maximum of 250 commits for a pull
+      # request」），`--paginate` 也突破不了：一个 251 提交的 PR 在这里永远数出
+      # 250，门禁（正确地）拒判，于是超过 250 个提交的 PR 永远合不进去。
+      # `repos/{r}/compare/{base}...{head}` 与 `git log BASE..HEAD` 同义，带分页
+      # 参数时**逐页给全**（不带时同样封顶 250——所以 per_page 显式写上，不赌 gh
+      # 会不会替你补），每条仍是同一种 commit 对象、`author.login` 照样由 GitHub
+      # 解析好，判定器一个字不用改（它取自默认分支，改接口要先落 main）。
+      #
+      # **为什么不改用 git 枚举**（#318 原提议）：git 只有邮箱，没有 GitHub 账号。
+      # 本仓库历史里三百多个提交的作者邮箱不是 noreply 形态，只靠 API 的
+      # `author.login` 才认得出人——换成 git，它们会全部落进 unresolved、门禁全红；
+      # 况且那还要把 PR 的对象取进这个 job，而这一格的安全前提是一行 PR 内容都不碰。
+      #
+      # 判据的主语：**这个 PR 在「此刻这一次快照」里的全部提交**。base / head /
+      # 声明的提交数从同一个 `pulls/{n}` 响应里一次读出，compare 就按这两个 SHA
+      # 取——三个数对的是同一个对象、同一个时刻。
+      #
+      # `--jq '.commits'` 按页应用、每页吐一个数组，产出「多个数组首尾相接」的
+      # 形状——判定器的 load_commits 本来就吃这种形状（见它的 docstring）。
+      # **`--slurp` 是错的解法**：它把每页包成一层，产出数组的数组。这里刻意不用。
+      #
+      # 真正要防的是**只拿到一部分却当成全部**：漏掉的人不会被检查，而门禁报绿。
+      # `test -s` 拦不住（文件非空）。所以取完之后四处对账，任何一处不等就红：
+      #   枚举条数 == 去重条数（分页重叠会让「条数对了、人却漏了」）
+      #           == compare 自报的 total_commits（同一把尺子量两次）
+      #           == PR 自己声明的 commits（主语对不对：比的真是这个 PR）
+      # 外加 head SHA 必须在枚举结果里。条数再传给判定器的 --expected-commits，
+      # 让它按**自己解析出的**条数再核一遍。
+      - name: 收集这个 PR 的贡献者（只读元数据）
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/pr-commits.json"
+
+          snap=$(gh api "repos/$REPO/pulls/$PR" --jq '"\(.base.sha) \(.head.sha) \(.commits)"')
+          read -r base head want <<< "$snap"
+          if ! [[ "$base" =~ ^[0-9a-f]{40}$ && "$head" =~ ^[0-9a-f]{40}$ && "$want" =~ ^[0-9]+$ ]]; then
+            echo "::error::读不出这个 PR 的 base / head / commits 快照：「$snap」"
+            exit 1
+          fi
+
+          if [ "$head" != "$PR_HEAD" ]; then
+            echo "::error::PR head 已改变，重跑当前提交的检查。"
+            exit 1
+          fi
+          cmp="repos/$REPO/compare/$base...$head"
+          gh api --paginate "$cmp?per_page=100" --jq '.commits' > "$out"
+          test -s "$out"
+          total=$(gh api "$cmp?per_page=1" --jq '.total_commits')
+
+          # 数的是**落进文件的**那一份（判定器读的也是它），不另取一遍。
+          # SHA 先落盘再数：`jq | grep -q` 在 pipefail 下会因 SIGPIPE 误报失败。
+          shas="$RUNNER_TEMP/pr-shas.txt"
+          jq -r '.[].sha' "$out" > "$shas"
+          got=$(wc -l < "$shas" | tr -d ' ')
+          uniq=$(sort -u "$shas" | wc -l | tr -d ' ')
+          if [ "$got" != "$uniq" ] || [ "$got" != "$total" ] || [ "$got" != "$want" ]; then
+            echo "::error::取到 $got 个提交（去重后 $uniq），compare 自报 $total 个，这个 PR 声明有 $want 个——"\
+                 "枚举不全或对错了对象。绝不按不完整的贡献者名单判定：漏掉的人不会被检查，而门禁会报绿。"
+            exit 1
+          fi
+          if ! grep -qx "$head" "$shas"; then
+            echo "::error::head $head 不在取到的 $got 个提交里——比的不是这个 PR。"
+            exit 1
+          fi
+          echo "CLA_EXPECTED_COMMITS=$want" >> "$GITHUB_ENV"
+          echo "提交数核对通过：$got / $want（compare ${base:0:8}...${head:0:8}）"
+
+      # 合并组候选的全部提交（只在服务模式）：判定器据此判「全员豁免」。同样只读元数据，
+      # 同样对账：枚举条数 == 去重条数 == compare 自报的 total_commits，head 必须在其中。
+      - name: 收集合并组候选的提交（只读元数据）
+        if: github.event_name == 'merge_group'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REPOSITORY_ID: ${{ github.event.repository.id }}
+          GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+          GROUP_HEAD: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          if [ "${CLA_SERVICE_MODE:-no}" != "yes" ]; then
+            echo "服务未启用：合并组判 not_applicable，不需要提交列表。"
+            exit 0
+          fi
+          if ! [[ "$GROUP_BASE" =~ ^[0-9a-f]{40}$ && "$GROUP_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::读不出合并组的 base / head：「$GROUP_BASE」「$GROUP_HEAD」"
+            exit 1
+          fi
+          out="$RUNNER_TEMP/group-commits.json"
+          cmp="repos/$REPO/compare/$GROUP_BASE...$GROUP_HEAD"
+          gh api --paginate "$cmp?per_page=100" --jq '.commits' > "$out"
+          test -s "$out"
+          total=$(gh api "$cmp?per_page=1" --jq '.total_commits')
+          shas="$RUNNER_TEMP/group-shas.txt"
+          jq -r '.[].sha' "$out" > "$shas"
+          got=$(wc -l < "$shas" | tr -d ' ')
+          uniq=$(sort -u "$shas" | wc -l | tr -d ' ')
+          if [ "$got" != "$uniq" ] || [ "$got" != "$total" ]; then
+            echo "::error::取到 $got 个提交（去重后 $uniq），compare 自报 $total 个——枚举不全，不能按它判定。"
+            exit 1
+          fi
+          if ! grep -qx "$GROUP_HEAD" "$shas"; then
+            echo "::error::head $GROUP_HEAD 不在取到的 $got 个提交里——比的不是这个候选。"
+            exit 1
+          fi
+          # 独立读 GitHub mergeQueue；不用 authority 的成员表决定该检查哪些 PR。
+          # gh graphql --paginate 只自动推进名为 endCursor 的变量。
+          # GraphQL variables must remain literal until gh sends the query.
+          # shellcheck disable=SC2016
+          query='query($owner:String!,$name:String!,$branch:String!,$endCursor:String) {
+            repository(owner:$owner,name:$name) { databaseId mergeQueue(branch:$branch) {
+              entries(first:100,after:$endCursor) { totalCount pageInfo { hasNextPage endCursor }
+                nodes { id position baseCommit { oid } headCommit { oid }
+                  pullRequest { number headRefOid baseRefName } } } } } }'
+          queue() {
+            gh api graphql --paginate -f query="$query" -f owner="${REPO%%/*}" \
+              -f name="${REPO#*/}" -f branch=main
+          }
+          before="$RUNNER_TEMP/group-queue-before.json"
+          after="$RUNNER_TEMP/group-queue-after.json"
+          queue > "$before"
+          # 这里只选取要读的 PR；完整分页、唯一候选、连续位置由可信 gate 最终核验。
+          numbers="$RUNNER_TEMP/group-pr-numbers.txt"
+          jq -s -r --arg base "$GROUP_BASE" --arg head "$GROUP_HEAD" '
+            [.[].data.repository.mergeQueue.entries.nodes[]] | sort_by(.position) as $q |
+            [$q[] | select(.baseCommit.oid == $base and .headCommit.oid == $head)] as $matches |
+            if ($matches | length) != 1 then error("candidate absent or ambiguous")
+            else $q[] | select(.position <= $matches[0].position) | .pullRequest.number end' \
+            "$before" > "$numbers"
+          records="$RUNNER_TEMP/group-pr-records.json"
+          : > "$records"
+          while IFS= read -r n; do
+            [[ "$n" =~ ^[1-9][0-9]*$ ]] || { echo "::error::队列 PR 号无效"; exit 1; }
+            pr_before="$RUNNER_TEMP/group-pr-$n-before.json"
+            pr_after="$RUNNER_TEMP/group-pr-$n-after.json"
+            pr_commits="$RUNNER_TEMP/group-pr-$n-commits.json"
+            gh api "repos/$REPO/pulls/$n" > "$pr_before"
+            read -r pr_base pr_head <<< "$(jq -r '"\(.base.sha) \(.head.sha)"' "$pr_before")"
+            [[ "$pr_base" =~ ^[0-9a-f]{40}$ && "$pr_head" =~ ^[0-9a-f]{40}$ ]] \
+              || { echo "::error::队列 PR base/head 无效"; exit 1; }
+            pr_cmp="repos/$REPO/compare/$pr_base...$pr_head"
+            gh api --paginate "$pr_cmp?per_page=100" --jq '.commits' > "$pr_commits"
+            read -r compare_base pr_total <<< "$(gh api "$pr_cmp?per_page=1" \
+              --jq '"\(.base_commit.sha) \(.total_commits)"')"
+            [[ "$compare_base" =~ ^[0-9a-f]{40}$ && "$pr_total" =~ ^[1-9][0-9]*$ ]] \
+              || { echo "::error::队列 PR compare 无效"; exit 1; }
+            gh api "repos/$REPO/pulls/$n" > "$pr_after"
+            jq -n --slurpfile before "$pr_before" --slurpfile after "$pr_after" \
+              --slurpfile commits "$pr_commits" --arg compare_base "$compare_base" \
+              --argjson total "$pr_total" \
+              '{before:$before[0],after:$after[0],commits:($commits | add),compare_base:$compare_base,total_commits:$total}' \
+              >> "$records"
+          done < "$numbers"
+          queue > "$after"
+          jq -n --argjson repository_id "$REPOSITORY_ID" --arg base "$GROUP_BASE" --arg head "$GROUP_HEAD" \
+            --slurpfile before "$before" --slurpfile after "$after" --slurpfile prs "$records" \
+            '{repository_id:$repository_id,base_sha:$base,head_sha:$head,queue_before:$before,queue_after:$after,prs:$prs}' \
+            > "$RUNNER_TEMP/group-snapshot.json"
+          echo "CLA_EXPECTED_COMMITS=$got" >> "$GITHUB_ENV"
+          echo "提交数核对通过：$got（compare ${GROUP_BASE:0:8}...${GROUP_HEAD:0:8}）"
+
+      # -I（隔离模式）：不把脚本目录挂进 sys.path、无视 PYTHONPATH——
+      # 与两个 Gate 同一双保险。
+      - name: 判定
+        env:
+          REPOSITORY_ID: ${{ github.event.repository.id }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+          GROUP_HEAD: ${{ github.event.merge_group.head_sha }}
+          # 不可变账号 id：线下签署按它认 PR 作者（login 能改名、能被抢注）。
+          # 用环境变量而不是参数传——判定器取自默认分支，参数要等它先落 main 才认得。
+          CLA_PR_AUTHOR_ID: ${{ github.event.pull_request.user.id }}
+        run: |
+          set -euo pipefail
+          ARGS=(--event "${{ github.event_name }}"
+                --policy "$TRUSTED/.github/cla-policy.json"
+                --repo-root "$TRUSTED")
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # --expected-commits：判定器按**自己解析出的**条数再核一遍（它在 main 上早就有这个参数）。
+            ARGS+=(--pr-author "$PR_AUTHOR"
+                   --commits-json "$RUNNER_TEMP/pr-commits.json"
+                   --expected-commits "$CLA_EXPECTED_COMMITS")
+          fi
+          if [ "${CLA_SERVICE_MODE:-no}" != "yes" ]; then
+            python3 -I "$TRUSTED/scripts/ci/cla_gate.py" "${ARGS[@]}"
+            exit 0
+          fi
+
+          FETCH_ARGS=(--event "${{ github.event_name }}"
+                      --policy "$TRUSTED/.github/cla-policy.json")
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            target="$GROUP_HEAD"
+            ARGS+=(--commits-json "$RUNNER_TEMP/group-commits.json"
+                   --expected-commits "$CLA_EXPECTED_COMMITS"
+                   --group-snapshot-json "$RUNNER_TEMP/group-snapshot.json"
+                   --verification-base "$GROUP_BASE")
+            FETCH_ARGS+=(--base "$GROUP_BASE")
+          else
+            target="$PR_HEAD"
+            ARGS+=(--verification-pr "$PR_NUMBER")
+            FETCH_ARGS+=(--pr "$PR_NUMBER")
+          fi
+          ARGS+=(--verification-head "$target" --verification-repository-id "$REPOSITORY_ID")
+          verdict="$RUNNER_TEMP/cla-verdict.json"
+          summary="$RUNNER_TEMP/cla-summary.md"
+          # 预判只负责全员 id 豁免与输入错误；不接受 App check 或任何旧回答。
+          rc=0
+          GITHUB_STEP_SUMMARY="$summary" python3 -I "$TRUSTED/scripts/ci/cla_gate.py" "${ARGS[@]}" \
+            > "$verdict" || rc=$?
+          if [ "$rc" -ne 1 ] || jq -e '.problems | any(startswith("unresolved:"))' "$verdict" > /dev/null; then
+            cat "$verdict"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then cat "$summary" >> "$GITHUB_STEP_SUMMARY"; fi
+            exit "$rc"
+          fi
+
+          # 绑定这次校验：随机 nonce + 开始时间；只有 fetch 能访问 policy 里的固定 origin。
+          nonce=$(python3 -I -c 'import secrets; print(secrets.token_urlsafe(32))')
+          not_before=$(date +%s)
+          answer="$RUNNER_TEMP/cla-eligibility.json"
+          # 先写失败文件：fetch 自身报错（含配置/运行异常）也必须交判定器给出红结论。
+          echo '{"error":"fetch_failed"}' > "$answer"
+          if ! env -u GH_TOKEN -u GITHUB_TOKEN -u ACTIONS_RUNTIME_TOKEN \
+            python3 -I "$TRUSTED/scripts/ci/cla_eligibility_fetch.py" "${FETCH_ARGS[@]}" \
+              --head "$target" --nonce="$nonce" --out "$answer" --budget-seconds 120; then
+            echo '{"error":"fetch_failed"}' > "$answer"
+          fi
+          ARGS+=(--verification-not-before "$not_before"
+                 --eligibility-nonce="$nonce"
+                 --eligibility-json "$answer")
+          python3 -I "$TRUSTED/scripts/ci/cla_gate.py" "${ARGS[@]}"
+
+      - name: Diagnose target and member binding on failure
+        if: failure()
+        run: |
+          set -euo pipefail
+          if [ -s "$RUNNER_TEMP/cla-eligibility.json" ]; then
+            jq 'del(.contributors,.nonce)' "$RUNNER_TEMP/cla-eligibility.json"
+          fi
+          if [ -s "$RUNNER_TEMP/group-snapshot.json" ]; then
+            jq '{base_sha,head_sha,
+              queue:[.queue_before[].data.repository.mergeQueue.entries.nodes[] |
+                {position,pr:.pullRequest.number,head_sha:.pullRequest.headRefOid}],
+              prs:[.prs[] | {pr:.before.number,head_sha:.before.head.sha}]}' \
+              "$RUNNER_TEMP/group-snapshot.json"
+          fi
+
+  # ────────────────────────────────────────────────────────────────
+  # 发行说明闸：用户可见的 PR 必须新增 docs/release-notes/unreleased/<主题>.md 片段
+  # （或旧写法：往 UNRELEASED.md 新增 `## `）待发条目，内部 PR 打 `no-release-note` 标签豁免（约定与理由见
+  # docs/RELEASING.md；判定逻辑与「用户可见路径」清单在
+  # scripts/ci/release_note_gate.py，看护在 tests/test_release_note_gate.py）。
+  #
+  # 为什么存在：发行说明以前是发版当天回头补的，补一个纯文档 PR 要跑满整条 CI
+  # 加合并队列（v0.19.2 两个，约 3 小时）。
+  #
+  # * **merge_group 上必须跑并且成功，不能 skipped。** fast gate 把 skipped 一律
+  #   当失败，这一格在队列候选上被跳过 = `CI fast gate` 永久红。脚本在
+  #   merge_group 上直接判 not_applicable 退出 0，理由：判据的输入是 PR 的文件列表
+  #   与标签，候选提交上两样都没有，PR 阶段已验过。
+  # * 判定器取自默认分支（与 cla-check / 两个 Gate 同一条纪律：PR 不能改写审判
+  #   自己的尺子）。默认分支上还没有这份脚本时（bootstrap 空窗，只存在于引入它的
+  #   PR 合并之前）才 sparse checkout 本次 revision 的那一份脚本作后备并 notice。
+  # * 只读元数据：不装依赖、几秒跑完。权限 contents: read + pull-requests: read。
+  # * push main 上不跑（与其它快线一致；Gate 也只在 PR / merge_group 上有意义）。
+  # * 标签取自事件 payload；`labeled` / `unlabeled` 本来就在 pull_request 的 types
+  #   里，打上 `no-release-note` 会起新 run，这一格重判。
